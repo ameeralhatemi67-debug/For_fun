@@ -1,8 +1,11 @@
 import type { HandLandmarker as HandLandmarkerType } from '@mediapipe/tasks-vision';
 
 export interface RawHand {
-  /** 21 landmarks in normalized *video* coords (0..1, not mirrored). */
-  landmarks: { x: number; y: number }[];
+  /**
+   * 21 landmarks in normalized *video* coords (0..1, not mirrored). z is MediaPipe's
+   * wrist-relative depth on roughly the same scale as x (it is not an absolute distance).
+   */
+  landmarks: { x: number; y: number; z: number }[];
   /** Handedness classification score, used as tracking confidence. */
   score: number;
   label: string;
@@ -85,7 +88,7 @@ export class HandTracker {
     for (let h = 0; h < res.landmarks.length; h++) {
       const cat = res.handedness?.[h]?.[0];
       hands.push({
-        landmarks: res.landmarks[h].map((p) => ({ x: p.x, y: p.y })),
+        landmarks: res.landmarks[h].map((p) => ({ x: p.x, y: p.y, z: p.z ?? 0 })),
         score: cat?.score ?? 1,
         label: cat?.categoryName ?? '?',
       });

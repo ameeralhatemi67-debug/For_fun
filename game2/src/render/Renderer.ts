@@ -34,6 +34,11 @@ export interface BodyLook {
   purpleMix: number;
   flash: number;
   energy: number;
+  /** Internal-flow origin (world units) — lags the body for flow inertia. */
+  flowX: number;
+  flowY: number;
+  /** Effective radius (world units) incl. size/depth scale — lens thickness + noise scale. */
+  radius: number;
 }
 
 export interface FrameView {
@@ -78,7 +83,7 @@ export class Renderer {
       this.blobA.push(new THREE.Vector4());
       this.blobB.push(new THREE.Vector4(1, 0, 1, 0));
     }
-    const v3 = () => [new THREE.Vector3(), new THREE.Vector3()];
+    const v3 = () => [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
     this.material = new THREE.ShaderMaterial({
       vertexShader: fluidVertex,
       fragmentShader: fluidFragment,
@@ -103,7 +108,7 @@ export class Renderer {
         uRim: { value: v3() },
         uAccent: { value: v3() },
         uBodyFx: { value: [new THREE.Vector4(), new THREE.Vector4()] },
-        uBaseRadius: { value: 0.07 },
+        uBodyR: { value: [0.07, 0.07] },
         uCoreBrightness: { value: 1 },
         uEdgeBrightness: { value: 1 },
         uRimWidth: { value: 2 },
@@ -111,6 +116,7 @@ export class Renderer {
         uGlowRadius: { value: 1 },
         uTurbAmount: { value: 1 },
         uTurbSpeed: { value: 0.5 },
+        uFlowInertia: { value: 0.7 },
         uRefraction: { value: 0.3 },
         uOpacity: { value: 0.9 },
         uShock: { value: new THREE.Vector4() },
@@ -175,10 +181,16 @@ export class Renderer {
       this.setMixed(u.uCore.value[b], look.base.core, PALETTES.purple.core, m);
       this.setMixed(u.uRim.value[b], look.base.rim, PALETTES.purple.rim, m);
       this.setMixed(u.uAccent.value[b], look.base.accent, PALETTES.purple.accent, m);
-      u.uBodyFx.value[b].set(look.flash, look.energy, 0, 0);
+      u.uBodyFx.value[b].set(look.flash, look.energy, look.flowX, look.flowY);
+      u.uBodyR.value[b] = Math.max(1e-3, look.radius);
     }
+    // The purple the A→B gradient passes through (fusion neck / overlap).
+    const P = PALETTES.purple;
+    u.uDeep.value[2].set(P.deep.r, P.deep.g, P.deep.b);
+    u.uCore.value[2].set(P.core.r, P.core.g, P.core.b);
+    u.uRim.value[2].set(P.rim.r, P.rim.g, P.rim.b);
+    u.uAccent.value[2].set(P.accent.r, P.accent.g, P.accent.b);
 
-    u.uBaseRadius.value = s.baseRadius;
     u.uCoreBrightness.value = s.coreBrightness;
     u.uEdgeBrightness.value = s.edgeBrightness;
     u.uRimWidth.value = s.rimWidth;
@@ -186,6 +198,7 @@ export class Renderer {
     u.uGlowRadius.value = s.glowRadius;
     u.uTurbAmount.value = s.turbulenceAmount;
     u.uTurbSpeed.value = s.turbulenceSpeed;
+    u.uFlowInertia.value = s.flowInertia;
     u.uRefraction.value = s.refraction;
     u.uOpacity.value = s.bodyOpacity;
     u.uShock.value.set(view.shock.x, view.shock.y, view.shock.r, view.shock.strength);

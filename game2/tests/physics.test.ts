@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_SETTINGS, type Settings } from '../src/config/schema';
+import { BlobBuffer } from '../src/physics/blobBuffer';
 import { DropletSystem } from '../src/physics/DropletSystem';
 import { FluidBody } from '../src/physics/FluidBody';
+import { holeRays, maxSilhouetteAspect } from './helpers/silhouette';
 
 const DT = 1 / 240;
 const S: Settings = { ...DEFAULT_SETTINGS };
@@ -187,5 +189,56 @@ describe('motion report', () => {
     expect(fast.maxLagRadii).toBeGreaterThan(medium.maxLagRadii);
     expect(violent.dropletsEmitted).toBeGreaterThan(0);
     expect(violent.maxLagRadii).toBeLessThanOrEqual(S.maxLag * 1.4 + 0.05);
+  });
+});
+
+describe('rendered silhouette (v0.2 liquid feel)', () => {
+  /** Eased sweep; returns max rendered aspect during motion and whether any frame had a hole. */
+  function silhouetteSweep(dist: number, moveTime: number, set: Settings = S) {
+    const b = spawn(0.5 - dist / 2, 0.5);
+    b.alive = true;
+    const x0 = 0.5 - dist / 2;
+    const x1 = 0.5 + dist / 2;
+    const ease = (u: number) => (u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2);
+    const hold = 0.3;
+    const tx = (t: number) => (t < hold ? x0 : t > hold + moveTime ? x1 : x0 + (x1 - x0) * ease((t - hold) / moveTime));
+    const buf = new BlobBuffer();
+    let maxAspect = 1;
+    let holes = 0;
+    let n = 0;
+    for (let t = 0; t < hold + moveTime + 1.0; t += DT) {
+      b.tx = tx(t);
+      b.tvx = (tx(t + DT) - tx(t - DT)) / (2 * DT);
+      b.step(DT, set, t);
+      if (++n % 12 !== 0) continue;
+      buf.clear();
+      b.writeBlobs(buf, set, 0);
+      // Measured from the drawn core (first blob).
+      const cx = buf.data[0];
+      const cy = buf.data[1];
+      if (t < hold + moveTime) maxAspect = Math.max(maxAspect, maxSilhouetteAspect(buf, cx, cy, R * 4));
+      if (holeRays(buf, cx, cy, R * 2.2, 24) > 0) holes++;
+    }
+    return { maxAspect, holes };
+  }
+
+  it('slow stays round, medium is clearly asymmetric/stretched', () => {
+    const slow = silhouetteSweep(0.6, 1.6);
+    const medium = silhouetteSweep(0.8, 0.8);
+    console.table({ slow, medium });
+    expect(slow.maxAspect).toBeLessThan(1.22);
+    expect(medium.maxAspect).toBeGreaterThan(1.3);
+  });
+
+  it('the drawn liquid never tears a hole into itself (no donut on hard stops)', () => {
+    // Body only (the tail is a curved tube, rays may legitimately re-enter it).
+    const noTail = { ...S, tailLength: 0 };
+    for (const [d, t] of [
+      [0.8, 0.8],
+      [1.0, 0.5],
+      [1.1, 0.35],
+    ] as const) {
+      expect(silhouetteSweep(d, t, noTail).holes).toBe(0);
+    }
   });
 });

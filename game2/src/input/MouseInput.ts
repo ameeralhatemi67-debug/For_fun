@@ -2,9 +2,11 @@
  * Mouse / touch "fake hand". Produces the same kind of anchor samples as the
  * camera tracker (positions in CSS px + presence), nothing more.
  *
- *   Mouse move over the stage   → Anchor A
- *   Shift + move / right-drag   → Anchor B
- *   Drag the red B handle       → Anchor B
+ *   Mouse move over the stage   → hand A (fingertip, or palm center in Palm pose)
+ *   Shift + move / right-drag   → hand B
+ *   Drag the B handle           → hand B
+ *   Mouse wheel                 → simulated depth (apparent hand size)
+ *   Left click                  → counted (handgun developer fallback)
  *   Touch: 1st finger → A, 2nd finger → B
  *   Pointer leaves the window   → A is "lost" (tests loss/fade behavior)
  */
@@ -18,7 +20,12 @@ export class MouseInput {
   /** Set by the engine: where B's handle is drawn (CSS px), for hit-testing. */
   bHandleX = -1e9;
   bHandleY = -1e9;
-  fusionMode = false;
+  /** Set by the engine: hand B is in play (fusion, or a second palm). */
+  bEnabled = false;
+  /** Simulated depth: apparent hand size multiplier (wheel). */
+  simDepth = 1;
+  /** Left clicks on the stage since start (consumers diff it). */
+  clicks = 0;
 
   private stage: HTMLElement | null = null;
   private roles = new Map<number, 'A' | 'B'>();
@@ -36,6 +43,7 @@ export class MouseInput {
     window.addEventListener('keyup', this.onKey);
     window.addEventListener('blur', this.onBlur);
     stage.addEventListener('contextmenu', this.onContext);
+    stage.addEventListener('wheel', this.onWheel, { passive: false });
   }
 
   detach(): void {
@@ -48,13 +56,14 @@ export class MouseInput {
     window.removeEventListener('keyup', this.onKey);
     window.removeEventListener('blur', this.onBlur);
     this.stage?.removeEventListener('contextmenu', this.onContext);
+    this.stage?.removeEventListener('wheel', this.onWheel);
     this.stage = null;
   }
 
   /** Default positions before the user touches anything. */
   ensurePlaced(w: number, h: number, s: number): void {
     if (!this.placedA) {
-      this.aX = w / 2 - (this.fusionMode ? 0.3 * s : 0);
+      this.aX = w / 2 - (this.bEnabled ? 0.3 * s : 0);
       this.aY = h / 2;
       this.placedA = true;
     }
@@ -92,7 +101,8 @@ export class MouseInput {
     if (!this.onStage(e)) return;
     const nearB = Math.hypot(e.clientX - this.bHandleX, e.clientY - this.bHandleY) < 44;
     let role: 'A' | 'B' = 'A';
-    if (this.fusionMode) {
+    if (e.button === 0 && e.pointerType === 'mouse') this.clicks++;
+    if (this.bEnabled) {
       if (nearB || e.button === 2) role = 'B';
       else if (e.pointerType !== 'mouse' && [...this.roles.values()].includes('A')) role = 'B';
     }
@@ -129,6 +139,11 @@ export class MouseInput {
   };
 
   private onContext = (e: Event) => e.preventDefault();
+
+  private onWheel = (e: WheelEvent) => {
+    e.preventDefault();
+    this.simDepth = Math.min(1.8, Math.max(0.55, this.simDepth * Math.exp(-e.deltaY * 0.0012)));
+  };
 
   private setB(x: number, y: number): void {
     this.bX = x;

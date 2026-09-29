@@ -118,8 +118,11 @@ export class AnchorFilter {
     let bx: number;
     let by: number;
     if (this.state === 'tracking') {
+      // Between samples: interpolate (a ∈ 0..1) shifted forward by `controlPrediction`
+      // intervals, so the control point is not a full tracker interval late. The heavy
+      // body downstream supplies the visible lag.
       const interval = Math.max(this.lastT - this.prevT, 1 / 240);
-      const a = clamp01((now - this.lastT) / interval);
+      const a = clamp01((now - this.lastT) / interval) + s.controlPrediction;
       bx = this.prevX + (this.lastX - this.prevX) * a;
       by = this.prevY + (this.lastY - this.prevY) * a;
     } else if (this.state === 'predicting') {

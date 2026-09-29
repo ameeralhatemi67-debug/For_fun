@@ -36,8 +36,8 @@ const PRESET_OVERRIDES: Record<string, Partial<Settings>> = {
     anchorMode: 'oneHand',
     baseRadius: 0.045,
     attractionRadius: 0.24,
-    mergeRadius: 0.075,
     minContactTime: 0.35,
+    fingerGap: 0.5,
   },
 };
 

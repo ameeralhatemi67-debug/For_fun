@@ -6,14 +6,16 @@ interface Props {
   settings: Settings;
   onChange: (key: string, value: number | boolean | string) => void;
   onCopy: () => void;
+  onDownload: () => void;
   onLoad: () => void;
+  onResetDepth: () => void;
   onReset: () => void;
   onPreset: (name: string) => void;
   onClose: () => void;
   notice: string;
 }
 
-const DEFAULT_OPEN: ParamGroup[] = ['Physics', 'Shape'];
+const DEFAULT_OPEN: ParamGroup[] = ['Anchor', 'Physics', 'Shape'];
 
 function decimals(step: number): number {
   const s = String(step);
@@ -94,9 +96,11 @@ export function ControlPanel(p: Props) {
         </button>
       </header>
       <div className="panel-actions">
+        <button onClick={p.onDownload} className="wide primary-soft">Download Settings JSON</button>
         <button onClick={p.onCopy}>Copy Settings JSON</button>
         <button onClick={p.onLoad}>Load Settings JSON</button>
         <button onClick={p.onReset}>Reset Defaults</button>
+        <button onClick={p.onResetDepth} title="B — the current hand distance becomes depth scale 1">Reset Depth Baseline</button>
         <select value="" onChange={(e) => e.target.value && p.onPreset(e.target.value)} aria-label="Apply preset">
           <option value="">Preset…</option>
           {PRESET_NAMES.map((n) => (
@@ -125,7 +129,9 @@ export function ControlPanel(p: Props) {
           </section>
         ))}
         <p className="panel-foot">
-          Double-click a slider to reset it. Highlighted rows differ from defaults. Settings persist in this browser.
+          Double-click a slider to reset it. Highlighted rows differ from defaults. Only changed values persist in this
+          browser, so new repo defaults still arrive. A downloaded file’s <code>settings</code> object can replace
+          <code>src/config/default-settings.json</code> directly (or run <code>npm run apply-settings -- file.json</code>).
           <br />
           Camera processing runs locally in your browser.
         </p>

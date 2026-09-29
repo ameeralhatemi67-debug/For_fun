@@ -1,20 +1,33 @@
 import { CameraController, coverRect, videoToScreen, type CoverRect } from '../camera/CameraController';
 import { DEFAULT_SETTINGS, type Settings } from '../config/schema';
 import { MouseInput } from '../input/MouseInput';
-import { scriptFrame, type ScriptName } from '../input/ScriptedMotion';
+import { ScriptDriver, SIM_PALM_SIZE } from '../input/ScriptDriver';
+import type { ScriptName } from '../input/ScriptedMotion';
+import { SimHand, type SimPose } from '../input/SyntheticHand';
 import { BlobBuffer } from '../physics/blobBuffer';
-import { DROPLET_POOL, DropletSystem } from '../physics/DropletSystem';
-import { FluidBody } from '../physics/FluidBody';
 import { drawDebug } from '../render/DebugDraw';
 import { PALETTES, Renderer, type BodyLook } from '../render/Renderer';
-import { AnchorFilter } from '../tracking/AnchorFilter';
-import { AnchorResolver, HandIdentity, type IdentifiedHand } from '../tracking/AnchorResolver';
+import { HandIdentity } from '../tracking/HandIdentity';
+import { HandPipeline, type HandInput } from '../tracking/HandPipeline';
 import { HandTracker } from '../tracking/HandTracker';
-import { clamp01, easeInOutCubic, expAlpha, makeRng } from '../utils/math';
-import { FusionStateMachine, type FusionState } from './FusionStateMachine';
+import { newLandmarks } from '../tracking/handModel';
+import { clamp, clamp01, expAlpha } from '../utils/math';
+import type { FusionState } from './FusionStateMachine';
+import { Simulation, type Mode } from './Simulation';
 
-export type Mode = 'sandbox' | 'fusion';
+export type { Mode } from './Simulation';
 export type InputSource = 'mouse' | 'camera' | 'script';
+/** Gesture the mouse's simulated hand makes (camera mode uses real gestures). */
+export type MouseGesture = 'TRACK' | 'PALM' | 'GUN';
+
+export interface HandStat {
+  id: number;
+  gesture: string;
+  raw: string;
+  fingers: string;
+  thumb: string;
+  depth: string;
+}
 
 export interface EngineStats {
   fps: number;
@@ -25,13 +38,20 @@ export interface EngineStats {
   anchorB: string;
   confidence: number;
   distance: number;
+  surfaceGap: number;
+  neck: number;
   droplets: number;
   speed: number;
   deformation: number;
+  aspect: number;
   handsMode: string;
   cameraStatus: string;
   trackerStatus: string;
   message: string;
+  control: string;
+  depthScale: number;
+  hands: HandStat[];
+  counters: string;
 }
 
 const MAX_STEP_DT = 1 / 240;
@@ -39,60 +59,69 @@ const MAX_SUBSTEPS = 16;
 const SHOCK_TIME = 0.55;
 
 /**
- * The engine: input → anchors → physics → renderer. It owns the render loop;
- * React only drives settings/mode and reads stats. Physics and rendering never
- * know whether an anchor came from MediaPipe, the mouse, or a test script.
+ * The engine shell: input sources → HandPipeline → Simulation → Renderer.
+ * It owns the render loop; React only drives settings/mode and reads stats.
  */
 export class EffectController {
   settings: Settings = { ...DEFAULT_SETTINGS };
-  mode: Mode = 'sandbox';
   input: InputSource = 'mouse';
   script: ScriptName = 'circle';
+  mouseGesture: MouseGesture = 'TRACK';
   debug = false;
   showHandles = true;
   /** Slow-motion factor for inspecting motion (1 = real time). Everything runs on this clock. */
   timeScale = 1;
   message = '';
 
+  readonly sim = new Simulation();
+  readonly pipeline = new HandPipeline();
   readonly renderer = new Renderer();
   readonly overlay = document.createElement('canvas');
   readonly camera = new CameraController();
   readonly tracker = new HandTracker();
-  private identity = new HandIdentity();
-  private resolver = new AnchorResolver();
   readonly mouse = new MouseInput();
-  readonly anchors = [new AnchorFilter(), new AnchorFilter()] as const;
-  readonly bodies = [new FluidBody(1.3), new FluidBody(4.7)] as const;
-  readonly droplets = new DropletSystem();
-  readonly fusion = new FusionStateMachine();
+  private identity = new HandIdentity();
+  private simHands = [new SimHand(), new SimHand()] as const;
+  private scriptDriver = new ScriptDriver();
   private blobs = new BlobBuffer();
-  private looks: [BodyLook, BodyLook] = [
-    { base: PALETTES.purple, purpleMix: 0, flash: 0, energy: 0 },
-    { base: PALETTES.red, purpleMix: 0, flash: 0, energy: 0 },
-  ];
-  private purpleTarget = [0, 0];
-  private sizeTarget = [1, 1];
-  private flashTarget = [0, 0];
-  private rng = makeRng(99);
+  private looks: [BodyLook, BodyLook] = [newLook(), newLook()];
 
   private container: HTMLElement | null = null;
   private octx: CanvasRenderingContext2D | null = null;
   private resizeObs: ResizeObserver | null = null;
   private raf = 0;
   private lastTime = -1;
-  private simTime = 0;
   /** Scaled clock (s) used by anchors, scripts and physics. */
   private clock = 0;
   private fps = 60;
   private scriptT0 = 0;
-  private hands: IdentifiedHand[] = [];
   private rect: CoverRect = { x: 0, y: 0, w: 1, h: 1 };
-  private shock = { x: 0, y: 0, t: SHOCK_TIME, strength: 0 };
   private overlayDirty = true;
+  private lastClicks = 0;
+  private pendingFire = false;
+  private mouseTilt = 0;
+  private mousePrevX = -1;
+  private gunRoll = Math.PI / 2;
   cssW = 1;
   cssH = 1;
   /** CSS px per world unit (= shorter viewport side). */
   S = 1;
+
+  get mode(): Mode {
+    return this.sim.mode;
+  }
+  get anchors() {
+    return this.sim.anchors;
+  }
+  get bodies() {
+    return this.sim.bodies;
+  }
+  get fusion() {
+    return this.sim.fusion;
+  }
+  get droplets() {
+    return this.sim.droplets;
+  }
 
   mount(container: HTMLElement): void {
     this.container = container;
@@ -123,12 +152,13 @@ export class EffectController {
   setSettings(s: Settings): void {
     const prq = s.maxPixelRatio !== this.settings.maxPixelRatio;
     this.settings = s;
+    this.sim.settings = s;
     if (prq) this.resize();
   }
 
   setMode(m: Mode): void {
-    if (m === this.mode) return;
-    this.mode = m;
+    if (m === this.sim.mode) return;
+    this.sim.setMode(m);
     this.resetEffect();
   }
 
@@ -138,10 +168,25 @@ export class EffectController {
     this.resetEffect();
   }
 
+  setMouseGesture(g: MouseGesture): void {
+    this.mouseGesture = g;
+  }
+
+  /** Space / click fallback: fire the handgun (thumb press for simulated hands). */
+  fire(): void {
+    this.pendingFire = true;
+  }
+
+  resetDepthBaseline(): void {
+    this.pipeline.resetDepthBaseline();
+    this.mouse.simDepth = 1;
+  }
+
   async setInput(src: InputSource): Promise<void> {
     this.input = src;
     this.message = '';
     this.scriptT0 = this.clock;
+    this.pipeline.reset();
     this.anchors[0].reset();
     this.anchors[1].reset();
     if (src === 'camera') {
@@ -149,7 +194,7 @@ export class EffectController {
         await this.camera.start();
         this.setMessage('Loading hand tracker…', 60);
         await this.tracker.init();
-        this.setMessage('Show your index finger to the camera.', 4);
+        this.setMessage('Point your index finger at the screen. Open your hand to push, thumb-up to aim.', 5);
       } catch (e) {
         // Camera or tracker unavailable: stay usable by falling back to the mouse.
         this.camera.stop();
@@ -169,26 +214,16 @@ export class EffectController {
 
   /** R: put everything back to a clean state for the current mode. */
   resetEffect(): void {
-    this.fusion.reset();
-    this.droplets.clear();
-    this.anchors.forEach((a) => a.reset());
+    this.sim.reset();
+    this.pipeline.reset();
     this.identity.reset();
     this.mouse.resetPlacement();
-    for (let i = 0; i < 2; i++) {
-      const b = this.bodies[i];
-      b.presence = 0;
-      b.presenceTarget = 0;
-      b.sizeScale = 1;
-      b.compression = 1;
-      this.looks[i].purpleMix = this.purpleTarget[i] = 0;
-      this.looks[i].flash = 0;
-      this.sizeTarget[i] = 1;
-    }
-    this.shock.t = SHOCK_TIME;
+    this.simHands.forEach((h) => h.snap());
+    this.scriptDriver.reset();
   }
 
   requestSplit(): void {
-    this.fusion.requestSplit();
+    this.sim.requestSplit();
   }
 
   get canvas(): HTMLCanvasElement {
@@ -196,31 +231,56 @@ export class EffectController {
   }
 
   getStats(): EngineStats {
-    const [A, B] = this.anchors;
-    const b0 = this.bodies[0];
-    const fusion = this.mode === 'fusion';
+    const sim = this.sim;
+    const [A, B] = sim.anchors;
+    const b0 = sim.bodies[0];
+    const fusion = sim.mode === 'fusion';
     let effectState: string;
-    if (fusion) effectState = this.fusion.state;
-    else if (A.state === 'tracking') effectState = 'TRACKING';
+    if (fusion) effectState = sim.fusion.state;
+    else if (!b0.alive) effectState = A.active ? 'POINT TO SPAWN' : 'IDLE';
+    else if (b0.spawning) effectState = 'SPAWNING';
+    else if (b0.control !== 'ANCHORED') effectState = b0.control;
     else if (A.state === 'predicting') effectState = 'PREDICTING';
-    else if (A.state === 'lost') effectState = b0.presence > 0.01 ? 'FADING' : 'LOST';
-    else effectState = 'IDLE';
+    else if (A.state === 'lost') effectState = 'FADING';
+    else effectState = 'TRACKING';
+    const c = sim.counters;
     return {
       fps: this.fps,
       trackerFps: this.input === 'camera' ? this.tracker.fps : 0,
       effectState,
-      fusionState: fusion ? this.fusion.state : '-',
+      fusionState: fusion ? sim.fusion.state : '-',
       anchorA: A.state,
       anchorB: fusion ? B.state : '-',
       confidence: A.confidence,
-      distance: fusion ? Math.hypot(A.x - B.x, A.y - B.y) : 0,
-      droplets: this.droplets.activeCount,
+      distance: fusion ? sim.centerDistance : 0,
+      surfaceGap: fusion ? sim.surfaceGap : NaN,
+      neck: sim.neck,
+      droplets: sim.droplets.activeCount,
       speed: b0.speed,
       deformation: b0.deformationAmount(this.settings),
-      handsMode: this.input === 'camera' ? (this.resolver.twoHandMode ? 'two hands' : 'one hand') : '-',
+      aspect: b0.aspectAmount(this.settings),
+      handsMode: fusion ? (sim.twoHandMode ? 'two hands' : 'one hand') : '-',
       cameraStatus: this.camera.status,
       trackerStatus: this.tracker.status,
       message: performance.now() < this.messageUntil ? this.message : '',
+      control: sim.bodies
+        .slice(0, sim.bodyCount)
+        .map((b) => (b.alive ? b.control : 'none'))
+        .join(' / '),
+      depthScale: b0.depthScale,
+      hands: this.pipeline.hands.map((h) => {
+        const r = h.reading;
+        const fs = (k: number) => (r.open[k] ? 'open' : 'closed');
+        return {
+          id: h.id,
+          gesture: h.visible ? h.gesture : `${h.gesture} (lost)`,
+          raw: r.raw,
+          fingers: `I ${fs(1)} M ${fs(2)} R ${fs(3)} P ${fs(4)}`,
+          thumb: `${r.thumbArmed ? 'armed' : 'folded'} ${r.thumbOpen.toFixed(2)}`,
+          depth: `${h.palmSize.toFixed(3)}u rel ${h.depthRel.toFixed(2)} → ×${h.depthScale.toFixed(2)}`,
+        };
+      }),
+      counters: `spawn ${c.spawns} shot ${c.shots} hit ${c.palmHits} recap ${c.recaptures} fuse ${c.fusions}`,
     };
   }
 
@@ -230,6 +290,8 @@ export class EffectController {
     this.cssW = Math.max(1, this.container.clientWidth);
     this.cssH = Math.max(1, this.container.clientHeight);
     this.S = Math.min(this.cssW, this.cssH);
+    this.sim.viewW = this.cssW / this.S;
+    this.sim.viewH = this.cssH / this.S;
     this.renderer.resize(this.cssW, this.cssH, this.settings.maxPixelRatio);
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     this.overlay.width = Math.round(this.cssW * dpr);
@@ -237,12 +299,15 @@ export class EffectController {
     this.overlay.style.width = `${this.cssW}px`;
     this.overlay.style.height = `${this.cssH}px`;
     this.octx?.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.overlayDirty = true;
   }
 
   private frame = (ms: number) => {
     this.raf = requestAnimationFrame(this.frame);
     if (this.frozen) {
+      // Keep presenting the frozen frame (the drawing buffer is not preserved).
       this.lastTime = ms / 1000;
+      this.renderFrame(0);
       return;
     }
     const wall = ms / 1000;
@@ -269,319 +334,131 @@ export class EffectController {
 
   private tick(dt: number, ms: number): void {
     this.clock += dt;
-    this.simTime += dt;
     const now = this.clock;
-
     if (this.input === 'camera' && this.camera.ready) {
       this.rect = coverRect(this.camera.video.videoWidth, this.camera.video.videoHeight, this.cssW, this.cssH);
     }
-    this.updateInputs(now, ms);
-    const s = this.settings;
-    this.anchors[0].sample(now, s);
-    this.anchors[1].sample(now, s);
-    this.updateEffect(dt, now);
+    this.pipeline.beginTick();
+    const inputs = this.collectHands(dt, now, ms);
+    this.pipeline.update(inputs, now, this.settings);
+    if (this.pendingFire && inputs !== null) {
+      // Camera / script: developer fallback fires a hand that is in the handgun pose (if any).
+      const h = this.pipeline.hands.find((hh) => hh.visible && hh.fresh && hh.gesture === 'HANDGUN');
+      if (h) h.forceFire = true;
+      this.pendingFire = false;
+    }
+    this.sim.update(dt, now, this.pipeline.hands, inputs !== null);
 
     // Split the frame into equal substeps no larger than MAX_STEP_DT. Unlike a fixed step
     // with a leftover accumulator this never aliases against 90/120/144 Hz displays.
     if (dt > 0) {
       const steps = Math.min(MAX_SUBSTEPS, Math.ceil(dt / MAX_STEP_DT - 1e-6));
       const h = dt / steps;
-      for (let i = 0; i < steps; i++) this.physicsStep(h);
+      for (let i = 0; i < steps; i++) this.sim.step(h, now - dt + h * (i + 1));
     }
-
     this.renderFrame(dt);
   }
 
-  private updateInputs(now: number, ms: number): void {
+  /** Hands for this tick (world landmarks), or null when no new tracker result arrived. */
+  private collectHands(dt: number, now: number, ms: number): HandInput[] | null {
     const s = this.settings;
-    const [A, B] = this.anchors;
     const S = this.S;
-    const fusion = this.mode === 'fusion';
-
+    const fusion = this.sim.mode === 'fusion';
     if (this.input === 'mouse') {
-      this.mouse.fusionMode = fusion;
-      this.mouse.ensurePlaced(this.cssW, this.cssH, S);
-      if (this.mouse.aInside) A.push(this.mouse.aX / S, this.mouse.aY / S, 1, now, s);
-      else A.missing(now, s);
-      if (fusion) B.push(this.mouse.bX / S, this.mouse.bY / S, 1, now, s);
-      else B.missing(now, s);
-      this.mouse.bHandleX = B.x * S;
-      this.mouse.bHandleY = B.y * S;
-      this.hands = [];
-    } else if (this.input === 'script') {
-      const cx = this.cssW / S / 2;
-      const cy = this.cssH / S / 2;
-      const f = scriptFrame(this.script, now - this.scriptT0, cx, cy);
-      if (f.aOn) A.push(cx + f.ax, cy + f.ay, 1, now, s);
-      else A.missing(now, s);
-      if (fusion && f.bOn) B.push(cx + f.bx, cy + f.by, 1, now, s);
-      else B.missing(now, s);
-      if (f.split && this.fusion.state === 'PURPLE') this.fusion.requestSplit();
-      this.hands = [];
-    } else if (this.camera.ready && this.tracker.status === 'ready') {
+      const m = this.mouse;
+      const palm = this.mouseGesture === 'PALM';
+      m.bEnabled = fusion || palm;
+      m.ensurePlaced(this.cssW, this.cssH, S);
+      m.bHandleX = m.bEnabled ? m.bX : -1e9;
+      m.bHandleY = m.bEnabled ? m.bY : -1e9;
+      const [ha, hb] = this.simHands;
+      const pose: SimPose = this.mouseGesture;
+      ha.setPose(pose);
+      hb.setPose(palm ? 'PALM' : 'TRACK');
+      if (this.pendingFire || m.clicks !== this.lastClicks) {
+        if (m.clicks !== this.lastClicks && pose === 'GUN') ha.pressThumb(now);
+        if (this.pendingFire && pose === 'GUN') ha.pressThumb(now);
+        this.lastClicks = m.clicks;
+        this.pendingFire = false;
+      }
+      ha.update(dt, now);
+      hb.update(dt, now);
+      // Virtual wrist lag: moving sideways tilts the pointing finger.
+      const ax = m.aX / S;
+      const ay = m.aY / S;
+      const vx = this.mousePrevX < 0 || dt <= 0 ? 0 : (ax - this.mousePrevX) / dt;
+      this.mousePrevX = ax;
+      this.mouseTilt += (clamp(vx * 0.12, -0.55, 0.55) - this.mouseTilt) * expAlpha(dt, 0.12);
+      let roll = this.mouseTilt;
+      if (pose === 'GUN') {
+        // Aim at hand B if present, else at the screen center.
+        const tx = m.bEnabled ? m.bX / S : this.cssW / S / 2;
+        const ty = m.bEnabled ? m.bY / S : this.cssH / S / 2;
+        if (Math.hypot(tx - ax, ty - ay) > 0.12) this.gunRoll = Math.atan2(tx - ax, -(ty - ay));
+        roll = this.gunRoll;
+      }
+      const out: HandInput[] = [];
+      if (m.aInside) {
+        const lm = ha.write({ x: ax, y: ay, anchor: palm ? 'palm' : 'indexTip', roll, size: SIM_PALM_SIZE * m.simDepth });
+        out.push({ id: 1, label: 'Sim A', confidence: 1, lm });
+      }
+      if (m.bEnabled) {
+        const lm = hb.write({ x: m.bX / S, y: m.bY / S, anchor: palm ? 'palm' : 'indexTip', roll: palm ? -0.2 : 0, size: SIM_PALM_SIZE, flip: true });
+        out.push({ id: 2, label: 'Sim B', confidence: 1, lm });
+      }
+      return out;
+    }
+    if (this.input === 'script') {
+      const f = this.scriptDriver.inputs(
+        this.script,
+        now - this.scriptT0,
+        dt,
+        now,
+        this.cssW / S,
+        this.cssH / S,
+        fusion,
+        this.sim.bodies[0],
+      );
+      if (this.scriptDriver.lastFrame?.split && this.sim.fusion.state === 'PURPLE') this.sim.requestSplit();
+      return f;
+    }
+    if (this.camera.ready && this.tracker.status === 'ready') {
       const raw = this.tracker.detect(this.camera.video, ms, s.trackerMaxFps);
-      if (raw) {
-        this.hands = this.identity.assign(raw, now);
-        const { a, b } = this.resolver.resolve(this.hands, s, now);
-        if (a) {
-          const p = videoToScreen(a.nx, a.ny, this.rect, s.mirror, this.cssW);
-          A.push(p.x / S, p.y / S, a.confidence, now, s);
-        } else A.missing(now, s);
-        if (fusion && b) {
-          const p = videoToScreen(b.nx, b.ny, this.rect, s.mirror, this.cssW);
-          B.push(p.x / S, p.y / S, b.confidence, now, s);
-        } else B.missing(now, s);
-      }
+      if (!raw) return null;
+      const hands = this.identity.assign(raw, now);
+      const zScale = this.rect.w / S;
+      return hands.map((h) => {
+        const lm = newLandmarks();
+        for (let i = 0; i < 21; i++) {
+          const p = h.landmarks[i];
+          const q = videoToScreen(p.x, p.y, this.rect, s.mirror, this.cssW);
+          lm[i * 3] = q.x / S;
+          lm[i * 3 + 1] = q.y / S;
+          lm[i * 3 + 2] = p.z * zScale;
+        }
+        return { id: h.id, label: h.label, confidence: h.score, lm };
+      });
     }
+    return null;
   }
 
-  /** New anchor after a long absence: spawn the (invisible) body there instead of flying in. */
-  private handleReappear(i: number, now: number): void {
-    const a = this.anchors[i];
-    if (!a.reappeared) return;
-    a.reappeared = false;
-    const b = this.bodies[i];
-    if (b.presence < 0.08) {
-      a.clearBlend();
-      a.sample(now, this.settings);
-      b.teleport(a.x, a.y);
-    }
-  }
-
-  private updateEffect(dt: number, now: number): void {
+  private renderFrame(_dt: number): void {
     const s = this.settings;
-    const [A, B] = this.anchors;
-    const [b0, b1] = this.bodies;
-    for (const b of this.bodies) {
-      b.extAx = b.extAy = 0;
-      b.reachGain = 0;
-      b.tremble = 0;
-      b.stiffnessBoost = 1;
-    }
-    this.flashTarget[0] = this.flashTarget[1] = 0;
-    this.handleReappear(0, now);
-
-    if (this.mode === 'sandbox') {
-      this.looks[0].base = PALETTES.purple;
-      b0.tx = A.x;
-      b0.ty = A.y;
-      b0.presenceTarget = A.active ? 1 : 0;
-      b1.presenceTarget = 0;
-      b1.presence = 0;
-      b0.tvx = A.vx;
-      b0.tvy = A.vy;
-      this.purpleTarget[0] = 0;
-      this.sizeTarget[0] = 1;
-      b0.compression += (1 - b0.compression) * expAlpha(dt, 0.08);
-    } else {
-      this.handleReappear(1, now);
-      this.looks[0].base = PALETTES.blue;
-      this.looks[1].base = PALETTES.red;
-      const bothActive = A.active && B.active;
-      const d = Math.hypot(A.x - B.x, A.y - B.y);
-      const ev = this.fusion.update(dt, d, bothActive, s);
-      if (ev === 'release') this.release();
-      else if (ev === 'split') this.split();
-      this.applyFusionState(dt, d);
-    }
-
-    // Presence: quick fade-in, configurable fade-out (the mass evaporates/shrinks).
-    for (const b of this.bodies) {
-      if (b.presenceTarget > b.presence) b.presence = Math.min(b.presenceTarget, b.presence + dt / 0.22);
-      else b.presence = Math.max(b.presenceTarget, b.presence - dt / s.fadeDuration);
-    }
+    const sim = this.sim;
+    sim.writeBlobs(this.blobs);
     for (let i = 0; i < 2; i++) {
+      const L = sim.looks[i];
+      const b = sim.bodies[i];
       const look = this.looks[i];
-      look.purpleMix += (this.purpleTarget[i] - look.purpleMix) * expAlpha(dt, 0.22);
-      look.flash = Math.max(this.flashTarget[i], look.flash * Math.exp(-dt * 3.2));
-      const b = this.bodies[i];
-      b.sizeScale += (this.sizeTarget[i] - b.sizeScale) * expAlpha(dt, 0.18);
-      const R = s.baseRadius * b.sizeScale;
-      b.volumeScale = Math.max(0.7, 1 - 0.5 * this.droplets.detachedVolume(i, R));
-      look.energy = clamp01(b.speed / 3);
+      look.base = PALETTES[L.base];
+      look.purpleMix = L.purpleMix;
+      look.flash = L.flash;
+      look.energy = L.energy;
+      look.flowX = b.flowX;
+      look.flowY = b.flowY;
+      look.radius = b.radius(s);
     }
-  }
-
-  private applyFusionState(dt: number, d: number): void {
-    const s = this.settings;
-    const [A, B] = this.anchors;
-    const [b0, b1] = this.bodies;
-    const st = this.fusion.state;
-    const relaxComp = (b: FluidBody) => (b.compression += (1 - b.compression) * expAlpha(dt, 0.06));
-
-    if (st === 'PURPLE') {
-      b0.tx = A.x;
-      b0.ty = A.y;
-      b0.tvx = A.vx;
-      b0.tvy = A.vy;
-      b0.presenceTarget = A.active ? 1 : 0;
-      b1.presenceTarget = 0;
-      b1.presence = 0;
-      this.purpleTarget[0] = 1;
-      this.sizeTarget[0] = s.purpleScale;
-      relaxComp(b0);
-      // Hand gone long enough for purple to evaporate → silently start over.
-      if (!A.active && b0.presence <= 0.001) {
-        this.fusion.reset();
-        this.purpleTarget[0] = this.looks[0].purpleMix = 0;
-        this.sizeTarget[0] = b0.sizeScale = 1;
-      }
-      return;
-    }
-
-    if (st === 'FUSING') {
-      const fp = this.fusion.fuseProgress(s);
-      const e = easeInOutCubic(fp);
-      const mx = B.active ? (A.x + B.x) / 2 : A.x;
-      const my = B.active ? (A.y + B.y) / 2 : A.y;
-      for (let i = 0; i < 2; i++) {
-        const b = this.bodies[i];
-        const o = this.bodies[1 - i];
-        b.tx = mx;
-        b.ty = my;
-        b.tvx = b.tvy = 0;
-        b.stiffnessBoost = 1 + 3 * e;
-        b.presenceTarget = 1;
-        b.compression = 1 - 0.42 * e;
-        // Squeeze: the pair shrinks slightly while charging, then pops out bigger on release.
-        b.sizeScale = this.sizeTarget[i] = 1 - 0.14 * e;
-        const dx = o.x - b.x;
-        const dy = o.y - b.y;
-        const dl = Math.hypot(dx, dy) || 1;
-        b.extAx = (dx / dl) * s.attractionStrength * 1.5;
-        b.extAy = (dy / dl) * s.attractionStrength * 1.5;
-        b.reachX = dx / dl;
-        b.reachY = dy / dl;
-        b.reachGain = s.reachStrength * (1 - e);
-        b.tremble = 0.5 + 0.5 * (1 - fp);
-        this.purpleTarget[i] = 0.25 + 0.75 * fp;
-        this.looks[i].purpleMix = Math.max(this.looks[i].purpleMix, this.purpleTarget[i]);
-        this.flashTarget[i] = 0.3 + 0.7 * fp * fp;
-      }
-      return;
-    }
-
-    // IDLE / DUAL / ATTRACTING / CONTACT / RECOVERING: two independent masses.
-    b0.tx = A.x;
-    b0.ty = A.y;
-    b1.tx = B.x;
-    b1.ty = B.y;
-    b0.tvx = A.vx;
-    b0.tvy = A.vy;
-    b1.tvx = B.vx;
-    b1.tvy = B.vy;
-    b0.presenceTarget = A.active ? 1 : 0;
-    b1.presenceTarget = B.active ? 1 : 0;
-    this.sizeTarget[0] = this.sizeTarget[1] = 1;
-    relaxComp(b0);
-    relaxComp(b1);
-    const cp = this.fusion.contactProgress(s);
-    this.purpleTarget[0] = this.purpleTarget[1] = st === 'CONTACT' ? 0.22 * cp : 0;
-
-    if (st === 'ATTRACTING' || st === 'CONTACT') {
-      const k = clamp01(1 - d / s.attractionRadius);
-      const dx = b1.x - b0.x;
-      const dy = b1.y - b0.y;
-      const dl = Math.hypot(dx, dy) || 1;
-      const ux = dx / dl;
-      const uy = dy / dl;
-      const a = s.attractionStrength * k * k;
-      b0.extAx = ux * a;
-      b0.extAy = uy * a;
-      b1.extAx = -ux * a;
-      b1.extAy = -uy * a;
-      const reach = s.reachStrength * Math.sqrt(k);
-      b0.reachX = ux;
-      b0.reachY = uy;
-      b1.reachX = -ux;
-      b1.reachY = -uy;
-      b0.reachGain = b1.reachGain = reach;
-      if (st === 'CONTACT') {
-        b0.tremble = b1.tremble = 0.25 + 0.6 * cp;
-        this.flashTarget[0] = this.flashTarget[1] = 0.3 * cp;
-      }
-    }
-  }
-
-  /** FUSING finished: the two masses become one purple mass, with a pop. */
-  private release(): void {
-    const s = this.settings;
-    const [b0, b1] = this.bodies;
-    const cx = (b0.x + b1.x) / 2;
-    const cy = (b0.y + b1.y) / 2;
-    const vx = (b0.vx + b1.vx) / 2;
-    const vy = (b0.vy + b1.vy) / 2;
-    const dx = cx - b0.x;
-    const dy = cy - b0.y;
-    b0.x = cx;
-    b0.y = cy;
-    b0.vx = vx;
-    b0.vy = vy;
-    for (let i = 0; i < b0.rx.length; i++) {
-      b0.rx[i] += dx;
-      b0.ry[i] += dy;
-    }
-    b0.sizeScale = this.sizeTarget[0] = s.purpleScale;
-    b0.compression = 0.55;
-    b0.radialImpulse(0.9 * s.fusionImpulse);
-    b1.presence = b1.presenceTarget = 0;
-    this.droplets.reparent(1, 0);
-    this.looks[0].purpleMix = this.purpleTarget[0] = 1;
-    this.looks[1].purpleMix = this.purpleTarget[1] = 1;
-    this.looks[0].flash = 1.2;
-    this.shock.x = cx;
-    this.shock.y = cy;
-    this.shock.t = 0;
-    this.shock.strength = s.fusionImpulse;
-    // Outward micro-droplets that later get pulled back in.
-    const R = s.baseRadius * s.purpleScale;
-    const n = s.fusionDroplets;
-    for (let k = 0; k < n; k++) {
-      const ang = (k / n) * Math.PI * 2 + (this.rng() - 0.5) * 0.8;
-      const ux = Math.cos(ang);
-      const uy = Math.sin(ang);
-      const sp = s.fusionImpulse * (0.3 + 0.35 * this.rng());
-      const r = s.baseRadius * (s.dropletMinSize + (s.dropletMaxSize - s.dropletMinSize) * this.rng() * 0.7);
-      this.droplets.spawn(0, cx + ux * R * 0.9, cy + uy * R * 0.9, vx + ux * sp, vy + uy * sp, r, DROPLET_POOL);
-    }
-  }
-
-  /** Purple splits back into blue (A) and red (B); red flows out of the purple mass. */
-  private split(): void {
-    const [b0, b1] = this.bodies;
-    b1.teleport(b0.x, b0.y);
-    b1.vx = b0.vx;
-    b1.vy = b0.vy;
-    b1.presence = 0.3;
-    b1.sizeScale = 0.8;
-    this.looks[1].purpleMix = 1;
-    this.purpleTarget[0] = this.purpleTarget[1] = 0;
-    this.sizeTarget[0] = this.sizeTarget[1] = 1;
-    b0.radialImpulse(0.5 * this.settings.fusionImpulse);
-  }
-
-  private physicsStep(dt: number): void {
-    const s = this.settings;
-    const t = this.simTime;
-    const fusion = this.mode === 'fusion';
-    for (let i = 0; i < 2; i++) {
-      const b = this.bodies[i];
-      if (b.presence > 0 || b.presenceTarget > 0) b.step(dt, s, t);
-    }
-    this.droplets.emit(dt, 0, this.bodies[0], s);
-    if (fusion && this.fusion.state !== 'PURPLE') this.droplets.emit(dt, 1, this.bodies[1], s);
-    this.droplets.update(dt, this.bodies, s);
-  }
-
-  private renderFrame(dt: number): void {
-    const s = this.settings;
-    this.blobs.clear();
-    this.bodies[0].writeBlobs(this.blobs, s, 0);
-    this.bodies[1].writeBlobs(this.blobs, s, 1);
-    this.droplets.writeBlobs(this.blobs, this.bodies);
-
-    const sh = this.shock;
-    sh.t += dt;
+    const sh = sim.shock;
     const k = clamp01(sh.t / SHOCK_TIME);
     const R = s.baseRadius * s.purpleScale;
     this.renderer.render(
@@ -589,7 +466,7 @@ export class EffectController {
         cssW: this.cssW,
         cssH: this.cssH,
         worldScale: this.S,
-        time: this.simTime,
+        time: this.clock,
         video: this.input === 'camera' && this.camera.ready ? this.camera.video : null,
         videoRect: this.rect,
         mirror: s.mirror,
@@ -602,7 +479,8 @@ export class EffectController {
 
     const ctx = this.octx;
     if (!ctx) return;
-    const needOverlay = this.debug || (this.showHandles && this.mode === 'fusion' && this.input === 'mouse');
+    const handles = this.showHandles && this.input === 'mouse' && this.mouse.bEnabled;
+    const needOverlay = this.debug || handles;
     if (!needOverlay && !this.overlayDirty) return;
     ctx.clearRect(0, 0, this.cssW, this.cssH);
     this.overlayDirty = needOverlay;
@@ -611,17 +489,17 @@ export class EffectController {
       ctx,
       S: this.S,
       debug: this.debug,
-      handles: this.showHandles && this.input === 'mouse',
-      fusionMode: this.mode === 'fusion',
-      anchors: this.anchors,
-      bodies: this.bodies,
-      droplets: this.droplets,
-      hands: this.hands,
-      handToScreen: (nx, ny) => videoToScreen(nx, ny, this.rect, s.mirror, this.cssW),
+      handleB: handles ? { x: this.mouse.bX, y: this.mouse.bY } : null,
+      sim,
+      hands: this.pipeline.hands,
+      now: this.clock,
       settings: s,
-      bodyCount: this.mode === 'fusion' ? 2 : 1,
     });
   }
+}
+
+function newLook(): BodyLook {
+  return { base: PALETTES.purple, purpleMix: 0, flash: 0, energy: 0, flowX: 0, flowY: 0, radius: 0.075 };
 }
 
 const easeOutQuad = (t: number) => 1 - (1 - t) * (1 - t);

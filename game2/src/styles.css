@@ -168,6 +168,10 @@ select option {
   padding-left: 8px;
   border-left: 1px solid var(--line);
 }
+.modebar select {
+  max-width: 150px;
+  text-overflow: ellipsis;
+}
 .modebar button.rec {
   color: #ff8080;
 }
@@ -249,6 +253,17 @@ select option {
 .panel-actions select {
   padding: 6px 8px;
   font-size: 12px;
+}
+.panel-actions .wide {
+  grid-column: 1 / -1;
+}
+.panel-actions .primary-soft {
+  background: rgba(177, 105, 255, 0.22);
+  border-color: rgba(177, 105, 255, 0.55);
+}
+.panel-foot code {
+  font-size: 10px;
+  color: #cdb6ef;
 }
 .panel-notice {
   margin: 8px 12px 0;
@@ -359,7 +374,25 @@ select option {
 .modal-actions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
   gap: 8px;
+}
+.modal-actions .spacer {
+  flex: 1;
+}
+.file-btn {
+  position: relative;
+  padding: 7px 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  cursor: pointer;
+}
+.file-btn input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
 }
 
 .showcase-hint {

@@ -93,11 +93,14 @@ export class DropletSystem {
       this.accum[bodyIndex] = 0;
       return;
     }
-    const speedEx = Math.max(0, body.speed / s.dropletSpeedThreshold - 1);
+    // A free-flying ball is not being yanked by anything: speed alone sheds much less,
+    // and there is no tether tension. Impacts still shed through the acceleration term.
+    const tethered = body.control === 'ANCHORED' || body.control === 'RECAPTURING';
+    const speedEx = Math.max(0, body.speed / s.dropletSpeedThreshold - 1) * (tethered ? 1 : 0.25);
     const accelEx = Math.max(0, body.accel / s.dropletAccelThreshold - 1);
     // Tether tension: the finger yanking relative to the mass pulls liquid out.
-    const relX = body.tvx - body.vx;
-    const relY = body.tvy - body.vy;
+    const relX = tethered ? body.tvx - body.vx : 0;
+    const relY = tethered ? body.tvy - body.vy : 0;
     const rel = Math.hypot(relX, relY);
     const tensionEx = Math.max(0, rel / (s.dropletSpeedThreshold * 1.1) - 1);
     const drive = speedEx * 0.6 + accelEx + tensionEx * 0.7;
@@ -215,12 +218,30 @@ export class DropletSystem {
       if (d.fadeT > 0) scale *= 1 - smoothstep(0, FADE_TIME, d.fadeT);
       // Pop-in: droplets grow over their first ~50 ms instead of appearing instantly.
       scale *= smoothstep(0, 0.05, d.age) * 0.6 + 0.4;
-      const wob = 1 + 0.09 * Math.sin(d.age * 16 + d.seed);
-      const sp = Math.hypot(d.vx - bodies[d.body].vx * 0.3, d.vy - bodies[d.body].vy * 0.3);
-      const stretch = 1 + clamp(sp * 0.18, 0, 0.7);
-      const dirX = sp > 1e-4 ? d.vx / Math.hypot(d.vx, d.vy) || 1 : 1;
-      const dirY = sp > 1e-4 ? d.vy / Math.hypot(d.vx, d.vy) || 0 : 0;
-      out.push(d.x, d.y, d.r * SINGLE_BLOB_SUPPORT * scale * wob, 1, dirX, dirY, stretch, d.body);
+      // Torn liquid, not a particle sprite: irregular wobble, velocity-stretched,
+      // with a thinner trailing sliver while it still flies fast.
+      const wob = 1 + 0.07 * Math.sin(d.age * 16 + d.seed) + 0.05 * Math.sin(d.age * 27.3 + d.seed * 2.1);
+      const b = bodies[d.body];
+      const rvx = d.vx - b.vx * 0.3;
+      const rvy = d.vy - b.vy * 0.3;
+      const sp = Math.hypot(rvx, rvy);
+      const stretch = 1 + clamp(sp * 0.45, 0, 1.8) + 0.12 * Math.sin(d.age * 11 + d.seed * 3.7) ** 2;
+      const dirX = sp > 1e-4 ? rvx / sp : 1;
+      const dirY = sp > 1e-4 ? rvy / sp : 0;
+      // While being swallowed the droplet reads as part of the body (no droplet shading).
+      const dropness = d.absorbT > 0 ? 0.3 : 1;
+      const sup = d.r * SINGLE_BLOB_SUPPORT * scale * wob;
+      out.push(d.x, d.y, sup, 1, dirX, dirY, stretch, d.body, dropness);
+      if (sp > 0.35 && d.absorbT === 0) {
+        const k = smoothstep(0.35, 1.2, sp);
+        const back = sup * (0.55 + 0.35 * k);
+        out.push(d.x - dirX * back, d.y - dirY * back, sup * 0.62, 0.75 * k, dirX, dirY, stretch * 1.2, d.body, dropness);
+      }
     }
+  }
+
+  /** Remove all droplets belonging to a body (despawn). They fade instead of popping. */
+  releaseBody(body: number): void {
+    for (const d of this.drops) if (d.active && d.body === body && d.fadeT === 0) d.fadeT = 1e-6;
   }
 }

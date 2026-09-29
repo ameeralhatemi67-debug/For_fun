@@ -1,14 +1,16 @@
 {
   "name": "zerog-energy-prototype",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "apply-settings": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/apply-settings.ts",
+    "tuning-table": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/tuning-table.ts"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^1.0.1",

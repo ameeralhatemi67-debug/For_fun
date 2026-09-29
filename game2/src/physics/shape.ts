@@ -20,11 +20,15 @@ export function kernel(d: number, support: number, weight = 1): number {
 export const SINGLE_BLOB_SUPPORT = 1 / Math.sqrt(1 - Math.cbrt(FIELD_THRESHOLD));
 
 // Unit-shape layout (before calibration): body radius 1.
-export const RING_DIST = 0.42;
-export const CENTER_SUPPORT = 1.0;
-export const RING_SUPPORT = 0.72;
+// v0.2: a smaller, lighter core and a wider, heavier ring, so the surface
+// points own more of the silhouette (≈35% more visible response to ring
+// deformation than v0.1) while the core still keeps the drop connected.
+export const RING_DIST = 0.55;
+export const CENTER_SUPPORT = 0.8;
+export const CENTER_WEIGHT = 0.7;
+export const RING_SUPPORT = 0.68;
 /** Ring blob weight is normalised by count so N does not change the look much. */
-export const ringWeight = (n: number) => 5 / n;
+export const ringWeight = (n: number) => 6.5 / n;
 export const TAIL_SUPPORT = [0.8, 0.64, 0.5] as const;
 
 const calibCache = new Map<number, number>();
@@ -38,7 +42,7 @@ export function shapeCalibration(n: number): number {
   if (cached !== undefined) return cached;
   const w = ringWeight(n);
   const fieldAt = (r: number, theta: number) => {
-    let f = kernel(r, CENTER_SUPPORT);
+    let f = kernel(r, CENTER_SUPPORT, CENTER_WEIGHT);
     for (let i = 0; i < n; i++) {
       const a = (i / n) * Math.PI * 2;
       const dx = r * Math.cos(theta) - RING_DIST * Math.cos(a);

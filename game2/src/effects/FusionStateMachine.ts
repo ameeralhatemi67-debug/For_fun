@@ -4,12 +4,21 @@ import { clamp01 } from '../utils/math';
 export type FusionState = 'IDLE' | 'DUAL' | 'ATTRACTING' | 'CONTACT' | 'FUSING' | 'PURPLE' | 'RECOVERING';
 export type FusionEvent = 'none' | 'fuseStart' | 'release' | 'split';
 
+/** Contact exit threshold = entry gap + this many radii × hysteresis. */
+const CONTACT_HYST_RADII = 1.5;
+
 /**
  * Pure fusion logic (no rendering, no physics) so it can be unit-tested.
  *
  *   IDLE → DUAL → ATTRACTING → CONTACT → FUSING → PURPLE → (split) RECOVERING → DUAL
  *
- * Entry thresholds are the configured radii; exit thresholds are larger by
+ * Two inputs drive it:
+ *  - `distance`: body-center distance, gates the broad attraction phase,
+ *  - `gap`: the visible liquid surface gap (center distance minus both
+ *    surface extents along the axis). CONTACT means the rendered liquids
+ *    actually touch, so what the user sees and what the logic believes agree.
+ *
+ * Entry thresholds are the configured values; exit thresholds are larger by
  * `hysteresis` so jitter around a boundary cannot flicker the state. After a
  * split the pair must separate beyond the attraction exit radius (re-arm) and
  * the cooldown must elapse before a new fusion can start.
@@ -45,14 +54,28 @@ export class FusionStateMachine {
     return this.state === 'PURPLE' ? 1 : 0;
   }
 
+  /** Surface gap (world units) below which CONTACT starts, for radius R. */
+  static contactEnterGap(s: Settings, R: number): number {
+    return s.contactGap * R;
+  }
+  static contactExitGap(s: Settings, R: number): number {
+    return (s.contactGap + s.hysteresis * CONTACT_HYST_RADII) * R;
+  }
+
   private go(next: FusionState): void {
     this.state = next;
     this.stateTime = 0;
   }
 
-  update(dt: number, distance: number, bothActive: boolean, s: Settings): FusionEvent {
+  /**
+   * @param distance body-center distance (u)
+   * @param gap visible surface gap (u, negative = overlapping)
+   * @param radius mean effective body radius (u), scales the contact thresholds
+   */
+  update(dt: number, distance: number, gap: number, bothActive: boolean, s: Settings, radius: number): FusionEvent {
     const attractExit = s.attractionRadius * (1 + s.hysteresis);
-    const mergeExit = s.mergeRadius * (1 + s.hysteresis);
+    const contactEnter = FusionStateMachine.contactEnterGap(s, radius);
+    const contactExit = FusionStateMachine.contactExitGap(s, radius);
     this.stateTime += dt;
     this.cooldown = Math.max(0, this.cooldown - dt);
     if (bothActive && distance > attractExit) this.armed = true;
@@ -69,15 +92,15 @@ export class FusionStateMachine {
         break;
       case 'ATTRACTING':
         if (!bothActive) this.go('IDLE');
-        else if (distance > attractExit) this.go('DUAL');
-        else if (distance < s.mergeRadius) {
+        else if (distance > attractExit && gap > contactExit) this.go('DUAL');
+        else if (gap < contactEnter) {
           this.contactTime = 0;
           this.go('CONTACT');
         }
         break;
       case 'CONTACT':
         if (!bothActive) this.go('IDLE');
-        else if (distance > mergeExit) this.go('ATTRACTING');
+        else if (gap > contactExit) this.go('ATTRACTING');
         else {
           this.contactTime += dt;
           if (this.contactTime >= s.minContactTime) {
